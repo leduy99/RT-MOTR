@@ -1,0 +1,21 @@
+name: omdet
+channels:
+  - nvidia
+  - pytorch
+  - fastai
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.9
+  - pytorch-cuda=11.8
+  - pytorch=2.1
+  - detectron2=0.6
+  - torchvision
+  - opencv-python-headless
+  - iopath
+  - joblib
+  - timm
+  - ftfy
+  - regex
+  - scipy
+  - python-lmdb

@@ -1,0 +1,117 @@
+MODEL:
+  META_ARCHITECTURE: OmDetV2Turbo
+  DEPLOY_MODE: true
+  SWIN:
+    OUT_FEATURES:
+      - 1
+      - 2
+      - 3
+    SIZE: T
+    USE_CHECKPOINT: false
+  BACKBONE:
+    NAME: build_swintransformer_backbone
+  LANGUAGE_BACKBONE:
+    MODEL_TYPE: "clip"
+    LANG_DIM: 512
+  DEVICE: cuda
+  FUSE_TYPE: merged_attn
+  TRANSFORMER_DECODER: ELADecoder
+  TRANSFORMER_ENCODER: ELAEncoder
+  TRACK_EMBEDDING_UPDATER: QIM
+  HEAD: DINOHead
+  ELAEncoder:
+    act: gelu
+    depth_mult: 1.0
+    dim_feedforward: 2048
+    encoder_layer: TransformerLayer
+    eval_size: null
+    expansion: 1.0
+    feat_strides:
+    - 8
+    - 16
+    - 32
+    hidden_dim: 256
+    in_channels:
+    - 192
+    - 384
+    - 768
+    num_encoder_layers: 1
+    pe_temperature: 10000
+    use_encoder_idx:
+    - 2
+  PIXEL_MEAN:
+  - 123.675
+  - 116.28
+  - 103.53
+  PIXEL_STD:
+  - 58.395
+  - 57.12
+  - 57.375
+  ELADecoder:
+    activation: relu
+    backbone_feat_channels:
+    - 256
+    - 256
+    - 256
+    box_noise_scale: 1.0
+    cls_type: cosine
+    dim_feedforward: 2048
+    dropout: 0.0
+    eps: 0.01
+    eval_idx: -1
+    eval_size: null
+    feat_strides:
+    - 8
+    - 16
+    - 32
+    hidden_dim: 256
+    label_noise_ratio: 0.5
+    learnt_init_query: false
+    nhead: 8
+    num_decoder_layers: 6
+    num_decoder_points: 4
+    num_denoising: 100
+    num_levels: 3
+    num_queries: 900
+    position_embed_type: sine
+  WEIGHTS: resources/OmDet-Turbo_tiny_SWIN_T.pth
+  QueryInteractionModule: 
+    dim_in: 256
+    hidden_dim: 1024
+    random_drop: 0.1
+    fp_ratio: 0.0
+    update_query_pos: false
+    merger_dropout: 0
+INPUT:
+  FORMAT: RGB
+  MAX_SIZE_TEST: 640
+  MIN_SIZE_TEST: 640
+TRAINING:
+  DATASET:
+    NAME: G2MOT
+    json_path: /mnt/d/Research/G2MOT/caption_queries/all_queries.json
+    DATA_ROOT: /mnt/d/Research
+  USE_DISTRIBUTED: false
+  AVAILABLE_GPUS: "gpu0"
+  BATCH_SIZE: 1
+  NUM_WORKERS: 4
+  SAMPLE_INTERVAL: [10]
+  SAMPLE_STEPS: [50, 90, 120]
+  SAMPLE_LENGTHS: [3, 4, 5, 6]
+  SAMPLE_MODES: ['random_interval']
+  SEED: 42
+  num_epochs: 50
+  LR: 2e-5
+  LR_drop: 40
+  clip_max_norm: 0.1
+  weight_decay: 1e-4
+  set_cost_class: 2
+  set_cost_bbox: 5
+  set_cost_giou: 2
+  mask_loss_coef: 1
+  dice_loss_coef: 1
+  cls_loss_coef: 2
+  bbox_loss_coef: 5
+  giou_loss_coef: 2
+  focal_alpha: 0.25
+  aux_loss: False
