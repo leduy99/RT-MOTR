@@ -95,6 +95,8 @@ def add_omdet_v2_turbo_config(cfg):
     cfg.TRAINING.cls_loss_coef = 2
     cfg.TRAINING.bbox_loss_coef = 5
     cfg.TRAINING.giou_loss_coef = 2
+    cfg.TRAINING.motion_bbox_loss_coef = 5
+    cfg.TRAINING.motion_giou_loss_coef = 2
     cfg.TRAINING.focal_alpha = 0.25
 
     cfg.TRAINING.LR = 2e-4

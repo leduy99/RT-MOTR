@@ -109,6 +109,19 @@ class G2MOT(MOTDataset):
             interval = min(randint(1, self.sample_interval), max_interval)
             frame_idxs = [begin_frame + interval * i for i in range(self.sample_length)]
             return frame_idxs
+        elif self.sample_mode == "random_interval_per_frame":
+            assert self.sample_length > 1, "Sample length is less than 2."
+            frame_idxs = [begin_frame]
+            for remaining_steps in range(self.sample_length - 1, 0, -1):
+                # Reserve one source frame for every later sample so the clip never
+                # crosses the video's final annotated frame.
+                max_interval = min(
+                    self.sample_interval,
+                    self.sample_vid_tmax[vid] - frame_idxs[-1] - (remaining_steps - 1))
+                if max_interval < 1:
+                    raise RuntimeError("Insufficient source frames for temporal sampling.")
+                frame_idxs.append(frame_idxs[-1] + randint(1, max_interval))
+            return frame_idxs
         else:
             raise ValueError(f"Sample mode {self.sample_mode} is not supported.")
 

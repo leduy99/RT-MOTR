@@ -130,7 +130,7 @@ class ELADecoder(nn.Module):
             "amp": cfg.SOLVER.AMP.ENABLED
         }
 
-    def forward(self, x, label_feats, task_feats, task_mask, track_instances, batch=None):
+    def forward(self, x, label_feats, task_feats, task_mask, track_instances, batch=None, time_delta=1):
         #from ultralytics.vit.utils.ops import get_cdn_group
         from .dn_ops import get_cdn_group
 
@@ -194,8 +194,9 @@ class ELADecoder(nn.Module):
                 new_attn_mask = new_attn_mask.repeat(self.nhead, 1, 1)
                 attn_mask = new_attn_mask.to(task_mask.device)
 
-        embed, refer_bbox, enc_bboxes, enc_scores = \
-            self._get_decoder_input(feats, shapes, label_feats, track_instances, dn_embed, dn_bbox)
+        embed, refer_bbox, enc_bboxes, enc_scores, motion_prior_boxes = \
+            self._get_decoder_input(
+                feats, shapes, label_feats, track_instances, dn_embed, dn_bbox, time_delta=time_delta)
 
         # decoder
         hs, pos, dec_bboxes, dec_scores = self.decoder(embed,
@@ -209,7 +210,7 @@ class ELADecoder(nn.Module):
                                               self.query_pos_head,
                                               attn_mask=attn_mask)
         x = dec_bboxes, dec_scores, enc_bboxes, enc_scores, dn_meta
-        return embed, hs, pos, x
+        return embed, hs, pos, x, motion_prior_boxes
 
     def _generate_anchors(self, shapes, grid_size=0.05, dtype=torch.float32, device='cpu', eps=1e-2):
         anchors = []
@@ -247,7 +248,8 @@ class ELADecoder(nn.Module):
         feats = torch.cat(feats, 1)
         return feats, shapes
 
-    def _get_decoder_input(self, feats, shapes, label_feats, track_instances=None, dn_embed=None, dn_bbox=None):
+    def _get_decoder_input(self, feats, shapes, label_feats, track_instances=None, dn_embed=None, dn_bbox=None,
+                           time_delta=1):
         bs = len(feats)
         # prepare input for decoder
         anchors, valid_mask = self._generate_anchors(shapes, dtype=feats.dtype, device=feats.device)
@@ -287,6 +289,7 @@ class ELADecoder(nn.Module):
         if dn_embed is not None:
             embeddings = torch.cat([dn_embed, embeddings], 1)
 
+        motion_prior_boxes = None
         if (track_instances is not None) and (len(track_instances) > 0):
             image_height, image_width = track_instances.image_size
             boxes = track_instances.pred_boxes.tensor.unsqueeze(0)
@@ -308,15 +311,24 @@ class ELADecoder(nn.Module):
                 normalized_boxes[:, :, [0, 2]] /= image_width  # Normalize x1 and x2
                 normalized_boxes[:, :, [1, 3]] /= image_height # Normalize y1 and y2
 
-            #predict boxes' shiftment and add with old boxes
+            # Predict the per-frame logit-space displacement of each existing track.
+            # At delta_t=1 this is exactly the previous behavior; a larger frame gap
+            # scales only the track-motion residual, not the image proposal branch.
+            normalized_boxes = normalized_boxes.clamp(min=1e-6, max=1 - 1e-6)
             anchors_from_track = torch.log(normalized_boxes / (1 - normalized_boxes))
-            refer_bbox_from_track = self.enc_bbox_head(track_instances.output_embs.unsqueeze(0)) + anchors_from_track
-        
+            delta_t = torch.as_tensor(time_delta, dtype=features.dtype, device=features.device).clamp(min=1)
+            track_motion = self.enc_bbox_head(
+                track_instances.query_pos[:, self.hidden_dim:].unsqueeze(0)) * delta_t
+            refer_bbox_from_track = anchors_from_track + track_motion
+            # This is the pre-decoder motion prediction in normalized cxcywh space.
+            # Keep it separate from Instances: only old tracks have a motion prior.
+            motion_prior_boxes = refer_bbox_from_track.sigmoid()
+
             enc_bboxes = torch.cat([enc_bboxes, normalized_boxes], 1)
             refer_bbox = torch.cat([refer_bbox, refer_bbox_from_track], 1)
-            embeddings = torch.cat([embeddings, track_instances.output_embs.unsqueeze(0)], 1)
+            embeddings = torch.cat([embeddings, track_instances.query_pos[:, self.hidden_dim:].unsqueeze(0)], 1)
 
-        return embeddings, refer_bbox, enc_bboxes, enc_scores
+        return embeddings, refer_bbox, enc_bboxes, enc_scores, motion_prior_boxes
 
     # TODO
     def _reset_parameters(self):

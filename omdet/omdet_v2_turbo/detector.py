@@ -57,6 +57,7 @@ class ClipMatcher(nn.Module):
     def initialize_for_single_clip(self, gt_instances: List[Instances]):
         self.gt_instances = gt_instances
         self.num_samples = 0
+        self.motion_num_samples = 0
         self.sample_device = None
         self._current_frame_idx = 0
         self.losses_dict = {}
@@ -224,7 +225,33 @@ class ClipMatcher(nn.Module):
 
         return losses
 
-    def match_for_single_frame(self, outputs):
+    def calc_loss_for_motion_prior(self, motion_prior_boxes: torch.Tensor, track_instances: Instances,
+                                   gt_instances: Instances):
+        """Supervise the pre-decoder box prior of tracks that persist into this frame."""
+        if motion_prior_boxes is None or motion_prior_boxes.numel() == 0:
+            return
+
+        num_track_priors = motion_prior_boxes.shape[1]
+        if num_track_priors > len(track_instances):
+            raise ValueError("Motion priors must correspond to the leading old-track slots.")
+
+        matched_gt_idxes = track_instances.matched_gt_idxes[:num_track_priors]
+        valid = matched_gt_idxes >= 0
+        if not valid.any():
+            return
+
+        pred_boxes = motion_prior_boxes[0, valid]
+        target_boxes = gt_instances.boxes[matched_gt_idxes[valid]]
+        loss_bbox = F.l1_loss(pred_boxes, target_boxes, reduction='none').sum()
+        loss_giou = 1 - torch.diag(generalized_box_iou(
+            box_cxcywh_to_xyxy(pred_boxes), box_cxcywh_to_xyxy(target_boxes)))
+
+        self.motion_num_samples += int(valid.sum().item())
+        frame_id = self._current_frame_idx
+        self.losses_dict[f'frame_{frame_id}_loss_motion_bbox'] = loss_bbox
+        self.losses_dict[f'frame_{frame_id}_loss_motion_giou'] = loss_giou.sum()
+
+    def match_for_single_frame(self, outputs, motion_prior_boxes=None):
         # outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
 
         gt_instances_i = self.gt_instances[self._current_frame_idx]  # gt instances of i-th image.
@@ -305,6 +332,11 @@ class ClipMatcher(nn.Module):
             gt_boxes = box_cxcywh_to_xyxy(gt_boxes)
             track_instances.iou[active_idxes] = matched_boxlist_iou(Boxes(active_track_boxes), Boxes(gt_boxes))
 
+        # The first slots of ``track_instances`` are the old tracks passed to the
+        # decoder.  Newborn detections were appended after them, so only the former
+        # have a valid pre-decoder motion prediction to supervise.
+        self.calc_loss_for_motion_prior(motion_prior_boxes, track_instances, gt_instances_i)
+
         # step7. merge the unmatched pairs and the matched pairs.
         matched_indices = torch.cat([new_matched_indices, prev_matched_indices], dim=0)
 
@@ -347,8 +379,9 @@ class ClipMatcher(nn.Module):
         # losses of each frame are calculated during the model's forwarding and are outputted by the model as outputs['losses_dict].
         losses = outputs.pop("losses_dict")
         num_samples = self.get_num_boxes(self.num_samples)
+        motion_num_samples = self.get_num_boxes(self.motion_num_samples)
         for loss_name, loss in losses.items():
-            losses[loss_name] /= num_samples
+            losses[loss_name] /= motion_num_samples if '_loss_motion_' in loss_name else num_samples
         return losses
 
 class RuntimeTrackerBase(object):
@@ -451,13 +484,14 @@ class OmDetV2Turbo(nn.Module):
         return results
     
     def gen_track_output(self, track_instances, pos_emb, hs, box_cls, box_pred, image_sizes, score_thresh, nms_thresh,
-                   max_num_det=None):
+                   max_num_det=None, motion_prior_boxes=None):
         
         if (track_instances != None) and (len(track_instances) > 0):
             track_embs = hs[ : , max_num_det: ]
             track_boxes = box_pred[ : , max_num_det: ] if self.training else box_cxcywh_to_xyxy(box_pred[ : , max_num_det: ]) * torch.tensor(image_sizes[0]).repeat(2).to(self.device)
             track_scores = torch.sigmoid(box_cls[:, max_num_det:])
             track_instances.output_embs = track_embs[0]
+            track_instances.scores = track_scores[0, :, 0]
             track_instances.pred_logits = box_cls[0][max_num_det: ]
             track_instances.pred_boxes = Boxes(track_boxes[0])
             track_instances.pred_boxes.clip(image_sizes[0])
@@ -469,7 +503,8 @@ class OmDetV2Turbo(nn.Module):
         results = self.inference(pos_emb, newborn_emb, newborn_cls, newborn_box, image_sizes, track_instances, score_thresh, nms_thresh, max_num_det)
 
         if self.training:
-            track_instances = self.criterion.match_for_single_frame(results[0])
+            track_instances = self.criterion.match_for_single_frame(
+                results[0], motion_prior_boxes=motion_prior_boxes)
             results[0] = track_instances
         
         results = self.track_qim(results)
@@ -559,13 +594,23 @@ class OmDetV2Turbo(nn.Module):
             box_pred_per_image = bbox_cxcywh_to_xyxy(box_pred_per_image) * torch.tensor(image_size).repeat(2).to(self.device)
         filter_mask = scores_per_image > score_thresh  # R x K
         score_keep = filter_mask.nonzero(as_tuple=False).view(-1)
+        embed = hs[:, score_keep]
+        query_pos = pos_emb[:, score_keep]
         box_pred_per_image = box_pred_per_image[score_keep]
         scores_per_image = scores_per_image[score_keep]
         labels_per_image = labels_per_image[score_keep]
 
         # NMS
         scores_per_image.to(self.device)
-        keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, nms_thresh)
+        ori_len = len(box_pred_per_image)
+        if track_instances != None:
+            box_4_nms = torch.cat((box_pred_per_image, track_instances.pred_boxes.tensor))
+            scores_4_nms = torch.cat((scores_per_image, torch.tensor([1.0] * (len(box_4_nms) - ori_len), device=self.device)))
+            labels_4_nms = torch.cat((labels_per_image, torch.tensor([0] * (len(box_4_nms) - ori_len), device=self.device)))
+            keep = batched_nms(box_4_nms, scores_4_nms, labels_4_nms, nms_thresh)
+            keep = keep[keep < ori_len]
+        else:
+            keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, nms_thresh)
         embed = hs[:, keep]
         query_pos = pos_emb[:, keep]
         box_pred_per_image = box_pred_per_image[keep]
@@ -707,6 +752,21 @@ class OmDetV2Turbo(nn.Module):
 
         return label_features, prompt_features, prompt_mask
     
+    @staticmethod
+    def _frame_delta(infos, frame_index: int) -> int:
+        """Return the number of source-video frames elapsed since the previous clip frame."""
+        if frame_index == 0:
+            return 1
+        previous_idx = infos[frame_index - 1].get('frame_idx')
+        current_idx = infos[frame_index].get('frame_idx')
+        if previous_idx is None or current_idx is None:
+            return 1
+        if torch.is_tensor(previous_idx):
+            previous_idx = previous_idx.item()
+        if torch.is_tensor(current_idx):
+            current_idx = current_idx.item()
+        return max(1, abs(int(current_idx) - int(previous_idx)))
+
     def forward(self, data: dict, do_postprocess=True, score_thresh=0.0, nms_thresh=1.0, debug=False):
         # Backbone
         frames = data['imgs']  # list of Tensor.
@@ -730,6 +790,7 @@ class OmDetV2Turbo(nn.Module):
         for frame_index, frame in enumerate(frames):
             frame.requires_grad = False
             is_last = frame_index == len(frames) - 1
+            time_delta = self._frame_delta(data['infos'], frame_index)
             body_feats = self.backbone(frame.unsqueeze(0).to(self.device))
 
             if type(body_feats) is dict:
@@ -739,14 +800,16 @@ class OmDetV2Turbo(nn.Module):
 
             # create label and prompt embeddings
             label_feats, prompt_feats, prompt_mask = self.get_language_embedding(language_input)
-            embed, hs, pos, decoder_feats = self.decoder(encoder_feats, label_feats, prompt_feats, prompt_mask, track_instances)
+            embed, hs, pos, decoder_feats, motion_prior_boxes = self.decoder(
+                encoder_feats, label_feats, prompt_feats, prompt_mask, track_instances, time_delta=time_delta)
             box_pred, box_cls, _ = self.loss_head(decoder_feats)
 
             pos_emb = torch.cat((pos, embed), dim=-1)
 
             result = self.gen_track_output(track_instances, pos_emb, hs, box_cls, box_pred, [frame.shape[1:]],
                                       score_thresh, nms_thresh,
-                                      max_num_det=self.num_proposals)
+                                      max_num_det=self.num_proposals,
+                                      motion_prior_boxes=motion_prior_boxes)
             track_instances = result
             results.append(result)
             outputs['pred_logits'].append(result.pred_logits)
@@ -756,7 +819,8 @@ class OmDetV2Turbo(nn.Module):
 
         return outputs
     
-    def forward_track(self, batched_inputs, track_instances=None, do_postprocess=True, score_thresh=0.0, nms_thresh=1.0, debug=False):
+    def forward_track(self, batched_inputs, track_instances=None, do_postprocess=True, score_thresh=0.0, nms_thresh=1.0,
+                      debug=False, time_delta=1):
         images, images_whwh, ann_types = self.preprocess_image(batched_inputs)
 
         # Backbone
@@ -770,7 +834,8 @@ class OmDetV2Turbo(nn.Module):
         if not self.training:
             # create label and prompt embeddings
             label_feats, prompt_feats, prompt_mask = self.get_language_embedding(batched_inputs)
-            embed, hs, pos, decoder_feats = self.decoder(encoder_feats, label_feats, prompt_feats, prompt_mask, track_instances)
+            embed, hs, pos, decoder_feats, _ = self.decoder(
+                encoder_feats, label_feats, prompt_feats, prompt_mask, track_instances, time_delta=time_delta)
             box_pred, box_cls, _ = self.loss_head(decoder_feats)
 
             pos_emb = torch.cat((pos, embed), dim=-1)

@@ -1,7 +1,7 @@
 .vscode
-.resources/*
-.exp_1/
-.outputs/
+.resources
+.exp_1
+.outputs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

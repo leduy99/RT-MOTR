@@ -1,10 +1,17 @@
-import os
-from datasets import build_dataset
-from detectron2.config import get_cfg
-from omdet.omdet_v2_turbo.config import add_omdet_v2_turbo_config
+import torch
 
-cfg = get_cfg()
-add_omdet_v2_turbo_config(cfg)
-cfg.merge_from_file(os.path.join('configs', 'OmDet-Turbo_tiny_SWIN_T' + '.yaml'))
+# Load the model state dict from the .pth file
+checkpoint = torch.load('exp_g2mot/latest.pth')
+print(checkpoint.keys())
 
-data = build_dataset(cfg, 'train')
+# Access the state dict
+state_dict = checkpoint['model_state_dict']  # Change 'model_state_dict' to whatever the current key is
+
+# Change the key from 'model_state_dict' to 'model'
+checkpoint['model'] = state_dict
+
+# Optionally, you can remove the old key if it's no longer needed
+del checkpoint['model_state_dict']
+
+# Save the modified checkpoint back to a .pth file
+torch.save(checkpoint, 'modified_model.pth')

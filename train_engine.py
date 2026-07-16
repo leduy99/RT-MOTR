@@ -138,6 +138,8 @@ def main():
         weight_dict.update({"frame_{}_loss_ce".format(i): cfg.TRAINING.cls_loss_coef,
                             'frame_{}_loss_bbox'.format(i): cfg.TRAINING.bbox_loss_coef,
                             'frame_{}_loss_giou'.format(i): cfg.TRAINING.giou_loss_coef,
+                            'frame_{}_loss_motion_bbox'.format(i): cfg.TRAINING.motion_bbox_loss_coef,
+                            'frame_{}_loss_motion_giou'.format(i): cfg.TRAINING.motion_giou_loss_coef,
                             })
 
     # TODO this is a hack
@@ -194,6 +196,7 @@ def main():
     train_func = train_one_epoch_mot
     dataset_train.set_epoch(0)
     for epoch in range(cfg.TRAINING.num_epochs):
+        dataset_train.set_epoch(epoch)
         if cfg.TRAINING.USE_DISTRIBUTED:
             sampler_train.set_epoch(epoch)
         train_stats = train_func(
